@@ -104,12 +104,13 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
         // Get cookies for the URL
         const cookies = await getCookiesForUrl(url);
 
-        // Send to native host
+        // Send to native host (include Chrome's detected file size as fallback)
         const response = await sendToNativeHost({
             url: url,
             cookies: cookies,
             userAgent: navigator.userAgent,
-            filename: downloadItem.filename || ""
+            filename: downloadItem.filename || "",
+            totalBytes: downloadItem.totalBytes || downloadItem.fileSize || 0
         });
 
         if (response.status === "success" && response.action === "downloaded") {

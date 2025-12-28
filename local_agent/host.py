@@ -186,6 +186,7 @@ def handle_download_request(message: dict) -> dict:
     cookies = message.get("cookies", "")
     user_agent = message.get("userAgent", "")
     suggested_filename = message.get("filename", "")
+    chrome_total_bytes = message.get("totalBytes", 0)  # Chrome's detected file size
     
     if not url:
         return {"status": "error", "message": "No URL provided"}
@@ -216,6 +217,12 @@ def handle_download_request(message: dict) -> dict:
         file_size = detect_result.get("size", 0)
         accept_ranges = detect_result.get("accept_ranges", False)
         filename = detect_result.get("suggested_filename") or suggested_filename or "download"
+        
+        # Use Chrome's totalBytes as fallback if HEAD request returns wrong size
+        # (common with auth-protected URLs where HEAD returns error page)
+        if file_size < 1024 * 1024 and chrome_total_bytes > 1024 * 1024:  # Detected < 1MB but Chrome sees > 1MB
+            log(f"HEAD returned {file_size} bytes, using Chrome's totalBytes: {chrome_total_bytes}")
+            file_size = chrome_total_bytes
         
         size_mb = file_size / (1024 * 1024) if file_size > 0 else 0
         
