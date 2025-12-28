@@ -18,8 +18,7 @@ from typing import Optional, Dict, Any
 GO_DOWNLOADER_PATH = Path(__file__).parent.parent / "G-Downloader" / "go-downloader.exe"
 DOWNLOAD_DIR = Path.home() / "Downloads"
 SIZE_THRESHOLD_MB = 50
-MAX_THREADS = 16
-CHUNK_SIZE_MB = 10
+MAX_CWND = 16  # Maximum congestion window (concurrent connections)
 
 
 def log(message: str):
@@ -138,29 +137,27 @@ def detect_resource(client: MCPClient, url: str, cookies: str = "", user_agent: 
     })
 
 
-def concurrent_download(
+def adaptive_download(
     client: MCPClient, 
     url: str, 
-    dest_path: str, 
-    threads: int,
+    dest_path: str,
     cookies: str = "",
-    user_agent: str = ""
+    user_agent: str = "",
+    max_cwnd: int = 16
 ) -> dict:
-    """Call concurrent_download tool on the Go MCP server."""
-    return client.call_tool("concurrent_download", {
+    """Call adaptive_download tool on the Go MCP server.
+    Uses TCP-like congestion control with binary tree segmentation.
+    """
+    return client.call_tool("adaptive_download", {
         "url": url,
         "dest_path": dest_path,
-        "threads": threads,
+        "initial_cwnd": 1,  # Start with slow start
+        "max_cwnd": max_cwnd,
         "cookies": cookies,
         "user_agent": user_agent
     })
 
 
-def calculate_threads(size_bytes: int) -> int:
-    """Calculate optimal number of threads based on file size."""
-    size_mb = size_bytes / (1024 * 1024)
-    threads = int(size_mb / CHUNK_SIZE_MB)
-    return max(1, min(threads, MAX_THREADS))
 
 
 def handle_download_request(message: dict) -> dict:
@@ -215,8 +212,7 @@ def handle_download_request(message: dict) -> dict:
                 "accept_ranges": accept_ranges
             }
         
-        # Step 3: Use concurrent download
-        threads = calculate_threads(file_size)
+        # Step 3: Use adaptive download with TCP-like congestion control
         dest_path = str(DOWNLOAD_DIR / filename)
         
         # Ensure unique filename
@@ -227,10 +223,10 @@ def handle_download_request(message: dict) -> dict:
             dest_path = f"{name} ({counter}){ext}"
             counter += 1
         
-        log(f"Starting download: {url} -> {dest_path} with {threads} threads")
+        log(f"Starting adaptive download: {url} -> {dest_path}")
         
-        download_result = concurrent_download(
-            client, url, dest_path, threads, cookies, user_agent
+        download_result = adaptive_download(
+            client, url, dest_path, cookies, user_agent, MAX_CWND
         )
         
         if download_result.get("status") == "success":
@@ -239,7 +235,8 @@ def handle_download_request(message: dict) -> dict:
                 "action": "downloaded",
                 "file_path": dest_path,
                 "file_size": file_size,
-                "threads_used": threads,
+                "segments": download_result.get("segment_count", 0),
+                "final_cwnd": download_result.get("final_cwnd", 1),
                 "time_elapsed": download_result.get("time_elapsed", 0)
             }
         else:

@@ -124,7 +124,7 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
 
             showNotification(
                 "Download Complete",
-                `${response.file_path}\n${sizeMB}MB in ${timeSeconds}s (${response.threads_used} threads)`
+                `${response.file_path}\n${sizeMB}MB in ${timeSeconds}s (${response.segments || 1} segments, cwnd=${response.final_cwnd || 1})`
             );
 
         } else if (response.action === "continue_native") {

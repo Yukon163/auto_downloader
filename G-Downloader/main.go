@@ -59,6 +59,32 @@ func main() {
 	)
 	s.AddTool(concurrentDownloadTool, tools.ConcurrentDownloadHandler)
 
+	// Register adaptive_download tool (TCP-like congestion control)
+	adaptiveDownloadTool := mcp.NewTool("adaptive_download",
+		mcp.WithDescription("Downloads a file using TCP-like congestion control with binary tree segmentation. Automatically adjusts concurrency based on connection quality."),
+		mcp.WithString("url",
+			mcp.Required(),
+			mcp.Description("The URL of the file to download"),
+		),
+		mcp.WithString("dest_path",
+			mcp.Required(),
+			mcp.Description("The destination path where the file will be saved"),
+		),
+		mcp.WithNumber("initial_cwnd",
+			mcp.Description("Initial congestion window size (default: 1)"),
+		),
+		mcp.WithNumber("max_cwnd",
+			mcp.Description("Maximum congestion window size (default: 16)"),
+		),
+		mcp.WithString("cookies",
+			mcp.Description("Optional cookies to include in the request"),
+		),
+		mcp.WithString("user_agent",
+			mcp.Description("Optional User-Agent header"),
+		),
+	)
+	s.AddTool(adaptiveDownloadTool, tools.AdaptiveDownloadHandler)
+
 	// Create stdio transport and start the server
 	log.SetOutput(os.Stderr) // Redirect logs to stderr to not interfere with stdio
 	if err := server.ServeStdio(s, server.WithStdioContextFunc(func(ctx context.Context) context.Context {
