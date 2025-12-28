@@ -17,13 +17,33 @@ from typing import Optional, Dict, Any
 # Configuration
 GO_DOWNLOADER_PATH = Path(__file__).parent.parent / "G-Downloader" / "go-downloader.exe"
 DOWNLOAD_DIR = Path.home() / "Downloads"
+LOG_DIR = Path.home() / ".auto_downloader" / "logs"
 SIZE_THRESHOLD_MB = 50
 MAX_CWND = 16  # Maximum congestion window (concurrent connections)
 
+# Ensure log directory exists
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_log_file():
+    """Get today's log file path."""
+    from datetime import datetime
+    return LOG_DIR / f"agent_{datetime.now().strftime('%Y-%m-%d')}.log"
 
 def log(message: str):
-    """Log to stderr (stdout is used for native messaging)."""
-    print(message, file=sys.stderr, flush=True)
+    """Log to both stderr and log file."""
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_line = f"[{timestamp}] {message}"
+    
+    # Write to stderr
+    print(log_line, file=sys.stderr, flush=True)
+    
+    # Write to log file
+    try:
+        with open(get_log_file(), "a", encoding="utf-8") as f:
+            f.write(log_line + "\n")
+    except Exception:
+        pass  # Don't fail if logging fails
 
 
 def get_native_message() -> Optional[dict]:

@@ -75,12 +75,14 @@ func NewCongestionController(initialCwnd, maxCwnd int) *CongestionController {
 	if maxCwnd < 1 {
 		maxCwnd = 16
 	}
-	return &CongestionController{
+	cc := &CongestionController{
 		cwnd:        initialCwnd,
 		ssthresh:    maxCwnd / 2, // Initial ssthresh is half of max
 		maxCwnd:     maxCwnd,
 		inSlowStart: true,
 	}
+	GetLogger().Log("Congestion Controller initialized: cwnd=%d, ssthresh=%d, maxCwnd=%d", initialCwnd, cc.ssthresh, maxCwnd)
+	return cc
 }
 
 func (cc *CongestionController) GetCwnd() int {
@@ -102,14 +104,17 @@ func (cc *CongestionController) AdjustWindow() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
+	oldCwnd := cc.cwnd
 	successes := atomic.SwapInt32(&cc.successCount, 0)
 	failures := atomic.SwapInt32(&cc.failureCount, 0)
+	phase := "no change"
 
 	if failures > 0 {
 		// Congestion detected: multiplicative decrease
 		cc.ssthresh = max(cc.cwnd/2, 1)
 		cc.cwnd = max(cc.cwnd/2, 1)
 		cc.inSlowStart = false
+		phase = "fast recovery"
 	} else if successes > 0 {
 		if cc.inSlowStart {
 			// Slow start: exponential increase
@@ -117,10 +122,16 @@ func (cc *CongestionController) AdjustWindow() {
 			if cc.cwnd >= cc.ssthresh {
 				cc.inSlowStart = false
 			}
+			phase = "slow start"
 		} else {
 			// Congestion avoidance: linear increase
 			cc.cwnd = min(cc.cwnd+1, cc.maxCwnd)
+			phase = "congestion avoidance"
 		}
+	}
+
+	if oldCwnd != cc.cwnd {
+		GetLogger().LogCwndChange(oldCwnd, cc.cwnd, phase)
 	}
 }
 
@@ -185,6 +196,8 @@ func (sm *SegmentManager) SplitSegment(seg *Segment) *Segment {
 		newSegments = append(newSegments, newSegment)
 	}
 	sm.segments = newSegments
+
+	GetLogger().LogSegmentSplit(seg.Start, seg.Size, newSegment.Start, newSegment.Size, len(sm.segments))
 
 	return newSegment
 }
@@ -307,8 +320,11 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 
 	// If no range support, do simple download
 	if !detectResult.AcceptRanges {
+		GetLogger().Log("No range support, using single download")
 		return singleDownload(ctx, args, fileSize, startTime)
 	}
+
+	GetLogger().LogDownloadStart(args.URL, fileSize, detectResult.AcceptRanges)
 
 	// Create destination directory
 	destDir := filepath.Dir(args.DestPath)
@@ -348,6 +364,7 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 				wg.Add(1)
 				go func(segment *Segment) {
 					defer wg.Done()
+					segmentStart := time.Now()
 
 					// Try to split segment for more parallelism
 					if newSeg := sm.SplitSegment(segment); newSeg != nil {
@@ -359,6 +376,7 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 
 					if err != nil {
 						cc.OnFailure()
+						GetLogger().LogSegmentFailed(segment.Start, segment.Size, err)
 						// Re-queue segment for retry
 						sm.QueueSegment(segment)
 						select {
@@ -367,6 +385,7 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 						}
 					} else {
 						cc.OnSuccess()
+						GetLogger().LogSegmentComplete(segment.Start, segment.Size, time.Since(segmentStart))
 						sm.MarkCompleted(segment, data)
 					}
 				}(seg)
@@ -416,6 +435,8 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 	result.BytesTotal = int64(n)
 	result.SegmentCount = sm.GetSegmentCount()
 	result.FinalCwnd = cc.GetCwnd()
+
+	GetLogger().LogDownloadComplete(result.BytesTotal, time.Since(startTime), result.SegmentCount, result.FinalCwnd)
 
 	return result
 }

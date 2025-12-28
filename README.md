@@ -53,6 +53,26 @@ go build -o go-downloader.exe .
 - 使用自适应拥塞控制下载（如支持 Range 请求）
 - 完成后显示通知（包含分片数和最终 cwnd）
 
+## 日志
+
+下载日志自动保存到 `~/.auto_downloader/logs/` 目录：
+
+| 日志文件 | 内容 |
+|----------|------|
+| `download_YYYY-MM-DD.log` | Go 下载器: cwnd 变化、分片操作、下载速度 |
+| `agent_YYYY-MM-DD.log` | Python Agent: 请求处理、决策逻辑 |
+
+**日志示例：**
+```
+[2025-12-29 06:30:00.123] === DOWNLOAD START ===
+[2025-12-29 06:30:00.124] URL: https://example.com/file.zip
+[2025-12-29 06:30:00.125] File Size: 100.00 MB (104857600 bytes)
+[2025-12-29 06:30:00.126] CWND Change: 1 -> 2 (slow start)
+[2025-12-29 06:30:00.500] Segment Complete: [0, size:52428800] in 0.37s (135.23 MB/s)
+[2025-12-29 06:30:01.200] === DOWNLOAD COMPLETE ===
+[2025-12-29 06:30:01.201] Average Speed: 83.45 MB/s
+```
+
 ## 组件
 
 | 组件 | 路径 | 说明 |
