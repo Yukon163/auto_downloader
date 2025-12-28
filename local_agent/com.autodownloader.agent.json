@@ -1,0 +1,9 @@
+{
+    "name": "com.autodownloader.agent",
+    "description": "Intelligent Download Agent - Native Messaging Host",
+    "path": "D:\\code\\ai_code\\auto_downloder\\local_agent\\host.bat",
+    "type": "stdio",
+    "allowed_origins": [
+        "chrome-extension://EXTENSION_ID_PLACEHOLDER/"
+    ]
+}

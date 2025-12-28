@@ -1,0 +1,16 @@
+# Go
+G-Downloader/go-downloader.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+local_agent/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
