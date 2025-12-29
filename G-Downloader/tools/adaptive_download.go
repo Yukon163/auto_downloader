@@ -15,247 +15,335 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-const (
-	// MaxSegmentSize limits the size of a single download chunk.
-	// Smaller segments mean more frequent updates to cwnd and progress.
-	// 32MB at 10MB/s = ~3.2s per round
-	MaxSegmentSize = 32 * 1024 * 1024
-)
-
 /*
-TCP-like Congestion Control Download Algorithm
+Dynamic Connection Splitting (Active Work Stealing) Algorithm
 
 Core concepts:
-1. Binary Tree Segmentation: Start with full file, split into halves recursively
-2. Congestion Window (cwnd): Number of concurrent downloads, dynamically adjusted
-3. Slow Start: cwnd starts at 1, doubles on each success until ssthresh
-4. Congestion Avoidance: After ssthresh, cwnd grows linearly
-5. Fast Recovery: On timeout/failure, halve ssthresh and cwnd
-
-Segment only tracks start position; end is calculated from next segment or file end.
+1. Supervisor Loop: Monitors active workers every 500ms.
+2. Active Splitting: If active_workers < cwnd, find the worker with the largest remaining bytes.
+   - Truncate its "StopAt" (atomic) to `Current + Remaining/2`.
+   - Launch a new worker for the second half.
+3. Workers: Check `Current >= StopAt` during download and stop early if active split occurred.
 */
 
-// AdaptiveDownloadResult represents the result of an adaptive download
+// AdaptiveDownloadResult represents the result of the download
 type AdaptiveDownloadResult struct {
 	Status       string  `json:"status"`
 	TimeElapsed  float64 `json:"time_elapsed"`
 	BytesTotal   int64   `json:"bytes_total,omitempty"`
-	SegmentCount int     `json:"segment_count,omitempty"`
+	SegmentCount int     `json:"segment_count,omitempty"` // For compatibility, number of splits performed
 	FinalCwnd    int     `json:"final_cwnd,omitempty"`
 	Error        string  `json:"error,omitempty"`
 }
 
-// AdaptiveDownloadArgs represents the arguments for adaptive download
+// AdaptiveDownloadArgs represents the arguments
 type AdaptiveDownloadArgs struct {
 	URL         string `json:"url"`
 	DestPath    string `json:"dest_path"`
 	Cookies     string `json:"cookies"`
 	UserAgent   string `json:"user_agent"`
-	InitialCwnd int    `json:"initial_cwnd"` // Optional: starting cwnd (default 1)
-	MaxCwnd     int    `json:"max_cwnd"`     // Optional: max concurrent connections (default 16)
-	Size        int64  `json:"size"`         // Optional: known file size (bypass HEAD detection)
+	InitialCwnd int    `json:"initial_cwnd"`
+	MaxCwnd     int    `json:"max_cwnd"`
+	Size        int64  `json:"size"`
 }
 
-// Segment represents a download segment (only start position needed)
-type Segment struct {
+// Worker represents an active download task
+type Worker struct {
+	ID        int
+	URL       string
 	Start     int64
-	Size      int64 // Current segment size
+	End       int64 // Original End (or current target end)
+	Current   int64 // Atomically updated: current write position
+	StopAt    int64 // Atomically updated: active stop limit (can be reduced by supervisor)
 	Completed bool
 }
 
-// CongestionController manages TCP-like congestion control
-type CongestionController struct {
-	mu          sync.Mutex
-	cwnd        int  // Congestion window (number of concurrent segments)
-	ssthresh    int  // Slow start threshold
-	maxCwnd     int  // Maximum cwnd
-	inSlowStart bool // Are we in slow start phase?
+// DownloadManager orchestrates the download
+type DownloadManager struct {
+	mu            sync.Mutex
+	fileSize      int64
+	activeWorkers []*Worker
+	completed     int64 // Number of completed segments (not bytes)
+	totalSegments int   // Total segments created
+	file          *os.File
+	args          AdaptiveDownloadArgs
+	ctx           context.Context
+	cancel        context.CancelFunc
 
-	successCount int32 // Atomic counter for successes in current window
-	failureCount int32 // Atomic counter for failures
+	// Error handling
+	errChan  chan error
+	firstErr error
 }
 
-func NewCongestionController(initialCwnd, maxCwnd int) *CongestionController {
-	if initialCwnd < 1 {
-		initialCwnd = 1
+func NewDownloadManager(ctx context.Context, args AdaptiveDownloadArgs, fileSize int64, file *os.File) *DownloadManager {
+	ctx, cancel := context.WithCancel(ctx)
+	return &DownloadManager{
+		fileSize:      fileSize,
+		activeWorkers: make([]*Worker, 0),
+		file:          file,
+		args:          args,
+		ctx:           ctx,
+		cancel:        cancel,
+		errChan:       make(chan error, 1),
 	}
-	if maxCwnd < 1 {
+}
+
+// Start begins the download process
+func (dm *DownloadManager) Start() AdaptiveDownloadResult {
+	startTime := time.Now()
+
+	// Initial worker for the whole file
+	initialWorker := &Worker{
+		ID:      1,
+		URL:     dm.args.URL,
+		Start:   0,
+		End:     dm.fileSize,
+		Current: 0,
+		StopAt:  dm.fileSize,
+	}
+
+	dm.addWorker(initialWorker)
+	go dm.runWorker(initialWorker)
+
+	// Supervisor Loop
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-dm.errChan:
+			dm.cancel()
+			return AdaptiveDownloadResult{
+				Status:      "error",
+				Error:       err.Error(),
+				TimeElapsed: time.Since(startTime).Seconds(),
+			}
+		case <-dm.ctx.Done():
+			return AdaptiveDownloadResult{
+				Status:      "error",
+				Error:       "download cancelled",
+				TimeElapsed: time.Since(startTime).Seconds(),
+			}
+		case <-ticker.C:
+			if dm.checkCompletion() {
+				return AdaptiveDownloadResult{
+					Status:       "success",
+					TimeElapsed:  time.Since(startTime).Seconds(),
+					BytesTotal:   dm.fileSize,
+					SegmentCount: dm.totalSegments,
+					FinalCwnd:    len(dm.activeWorkers), // Rough estimate
+				}
+			}
+			dm.supervise()
+		}
+	}
+}
+
+// checkCompletion checks if all bytes are downloaded
+// In this simplified model, we track workers. If active workers list is empty + no errors, we are done?
+// Ideally we should track bytes.
+// Actually, simpler: if all Created segments are Completed.
+// But segments are dynamic.
+// Let's rely on: if activeWorkers is empty and we covered the range.
+// But better: Supervisor checks if activeWorkers is empty. If so, and no error, we are done.
+func (dm *DownloadManager) checkCompletion() bool {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	return len(dm.activeWorkers) == 0
+}
+
+// supervise checks if we should split any workers
+func (dm *DownloadManager) supervise() {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	activeCount := len(dm.activeWorkers)
+	maxCwnd := dm.args.MaxCwnd
+	if maxCwnd <= 0 {
 		maxCwnd = 16
 	}
-	cc := &CongestionController{
-		cwnd:        initialCwnd,
-		ssthresh:    maxCwnd / 2, // Initial ssthresh is half of max
-		maxCwnd:     maxCwnd,
-		inSlowStart: true,
-	}
-	GetLogger().Log("Congestion Controller initialized: cwnd=%d, ssthresh=%d, maxCwnd=%d", initialCwnd, cc.ssthresh, maxCwnd)
-	return cc
-}
 
-func (cc *CongestionController) GetCwnd() int {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	return cc.cwnd
-}
+	// We can add more workers if we haven't reached maxCwnd
+	if activeCount < maxCwnd {
+		// Find candidate to split (largest remaining bytes)
+		var candidate *Worker
+		var maxRemaining int64 = 0
 
-func (cc *CongestionController) OnSuccess() {
-	atomic.AddInt32(&cc.successCount, 1)
-}
+		for _, w := range dm.activeWorkers {
+			current := atomic.LoadInt64(&w.Current)
+			stopAt := atomic.LoadInt64(&w.StopAt)
+			remaining := stopAt - current
 
-func (cc *CongestionController) OnFailure() {
-	atomic.AddInt32(&cc.failureCount, 1)
-}
-
-// AdjustWindow is called after a round of downloads
-func (cc *CongestionController) AdjustWindow() {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	oldCwnd := cc.cwnd
-	successes := atomic.SwapInt32(&cc.successCount, 0)
-	failures := atomic.SwapInt32(&cc.failureCount, 0)
-	phase := "no change"
-
-	if failures > 0 {
-		// Congestion detected: multiplicative decrease
-		cc.ssthresh = max(cc.cwnd/2, 1)
-		cc.cwnd = max(cc.cwnd/2, 1)
-		cc.inSlowStart = false
-		phase = "fast recovery"
-	} else if successes > 0 {
-		if cc.inSlowStart {
-			// Slow start: exponential increase
-			cc.cwnd = min(cc.cwnd*2, cc.maxCwnd)
-			if cc.cwnd >= cc.ssthresh {
-				cc.inSlowStart = false
+			// Only split if remaining is large enough (e.g. > 10MB)
+			// AND it's significantly larger than others? Just max is fine.
+			if remaining > 10*1024*1024 && remaining > maxRemaining {
+				maxRemaining = remaining
+				candidate = w
 			}
-			phase = "slow start"
-		} else {
-			// Congestion avoidance: linear increase
-			cc.cwnd = min(cc.cwnd+1, cc.maxCwnd)
-			phase = "congestion avoidance"
+		}
+
+		if candidate != nil {
+			dm.splitWorker(candidate)
 		}
 	}
-
-	if oldCwnd != cc.cwnd {
-		GetLogger().LogCwndChange(oldCwnd, cc.cwnd, phase)
-	}
 }
 
-// SegmentManager manages binary tree segmentation
-type SegmentManager struct {
-	mu             sync.Mutex
-	fileSize       int64
-	segments       []*Segment    // Sorted by start position
-	pendingQueue   chan *Segment // Segments waiting to be downloaded
-	completedCount int64
+// splitWorker splits a worker into two
+func (dm *DownloadManager) splitWorker(w *Worker) {
+	current := atomic.LoadInt64(&w.Current)
+	stopAt := atomic.LoadInt64(&w.StopAt)
+
+	// Calculate split point (midpoint of remaining)
+	remaining := stopAt - current
+	splitPoint := current + (remaining / 2)
+
+	// Ensure split point is aligned? Not strictly necessary for `os.WriteAt`.
+
+	// Create new worker for the second half
+	newWorker := &Worker{
+		ID:      dm.totalSegments + 2, // Simple ID generation
+		URL:     dm.args.URL,
+		Start:   splitPoint,
+		End:     stopAt,     // Take the original stopAt
+		Current: splitPoint, // Starts at split point
+		StopAt:  stopAt,
+	}
+
+	// Update old worker to stop at split point
+	atomic.StoreInt64(&w.StopAt, splitPoint)
+
+	GetLogger().Log("Splitting Worker %d: OldRange[%d-%d] -> NewStop[%d]. New Worker %d taking [%d-%d]",
+		w.ID, w.Start, stopAt, splitPoint, newWorker.ID, splitPoint, stopAt)
+
+	dm.activeWorkers = append(dm.activeWorkers, newWorker)
+	dm.totalSegments++
+
+	go dm.runWorker(newWorker)
 }
 
-func NewSegmentManager(fileSize int64) *SegmentManager {
-	sm := &SegmentManager{
-		fileSize:     fileSize,
-		segments:     make([]*Segment, 0),
-		pendingQueue: make(chan *Segment, 1000),
-	}
-
-	// Start with single segment covering entire file
-	initialSegment := &Segment{
-		Start: 0,
-		Size:  fileSize,
-	}
-	sm.segments = append(sm.segments, initialSegment)
-	sm.pendingQueue <- initialSegment
-
-	return sm
+func (dm *DownloadManager) addWorker(w *Worker) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.activeWorkers = append(dm.activeWorkers, w)
+	dm.totalSegments++
 }
 
-// SplitSegment performs binary split on a segment
-func (sm *SegmentManager) SplitSegment(seg *Segment) *Segment {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
+func (dm *DownloadManager) removeWorker(w *Worker) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
 
-	// Only split if segment is large enough (> 1MB)
-	if seg.Size < 1024*1024 {
-		return nil
-	}
-
-	// Binary split: create new segment at midpoint
-	newSize := seg.Size / 2
-	newSegment := &Segment{
-		Start: seg.Start + newSize,
-		Size:  seg.Size - newSize,
-	}
-
-	// Update original segment size
-	seg.Size = newSize
-
-	// Insert new segment into sorted list
-	inserted := false
-	newSegments := make([]*Segment, 0, len(sm.segments)+1)
-	for _, s := range sm.segments {
-		if !inserted && s.Start > newSegment.Start {
-			newSegments = append(newSegments, newSegment)
-			inserted = true
+	newActive := make([]*Worker, 0, len(dm.activeWorkers))
+	for _, active := range dm.activeWorkers {
+		if active != w {
+			newActive = append(newActive, active)
 		}
-		newSegments = append(newSegments, s)
 	}
-	if !inserted {
-		newSegments = append(newSegments, newSegment)
-	}
-	sm.segments = newSegments
-
-	GetLogger().LogSegmentSplit(seg.Start, seg.Size, newSegment.Start, newSegment.Size, len(sm.segments))
-
-	return newSegment
+	dm.activeWorkers = newActive
 }
 
-// GetPendingSegment gets next segment to download
-func (sm *SegmentManager) GetPendingSegment(timeout time.Duration) (*Segment, bool) {
-	select {
-	case seg := <-sm.pendingQueue:
-		return seg, true
-	case <-time.After(timeout):
-		return nil, false
+func (dm *DownloadManager) runWorker(w *Worker) {
+	defer dm.removeWorker(w)
+
+	// We use w.StopAt as the REQUESTED end, but realizing that HTTP range is inclusive
+	// and we might want to request *more* and stop early, OR just request the current StopAt.
+	// Since StopAt changes dynamically, we can't request "Until StopAt" because StopAt might shrink!
+	// Wait, if we shrink StopAt, the HTTP request we *already sent* is fine, we just stop reading.
+	// But for the NEW worker, we need a known range.
+	// The problem is: what if we request Start-End (End=FileSize), but then we split it?
+	// That works. The old worker just stops reading.
+	// So we should request Start-End (where End is the *original* intended end, or even FileSize-1).
+	// Let's request Start-w.End. w.End is the *max* it could ever go to.
+	// w.StopAt is the *current* limit.
+
+	reqEnd := w.End
+	if reqEnd > dm.fileSize {
+		reqEnd = dm.fileSize
+	}
+
+	// Ranges are inclusive.
+	rangeStart := w.Start
+	rangeEnd := reqEnd - 1
+
+	// Use a loop to retry on failure?
+	// For "TCP-like", we should retry.
+	// But here simplicity: if fail, report error.
+
+	GetLogger().Log("Worker %d starting: %d - %d", w.ID, rangeStart, rangeEnd)
+
+	client := &http.Client{
+		Timeout: 30 * time.Minute,
+	}
+
+	req, err := http.NewRequestWithContext(dm.ctx, "GET", w.URL, nil)
+	if err != nil {
+		dm.reportError(err)
+		return
+	}
+
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd))
+	if dm.args.Cookies != "" {
+		req.Header.Set("Cookie", dm.args.Cookies)
+	}
+	if dm.args.UserAgent != "" {
+		req.Header.Set("User-Agent", dm.args.UserAgent)
+	} else {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		dm.reportError(err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		dm.reportError(fmt.Errorf("unexpected status code: %d", resp.StatusCode))
+		return
+	}
+
+	buf := make([]byte, 32*1024) // 32KB buffer
+
+	for {
+		// Check active split condition
+		current := atomic.LoadInt64(&w.Current)
+		stopAt := atomic.LoadInt64(&w.StopAt)
+
+		if current >= stopAt {
+			// We reached our dynamic limit (someone stole the rest)
+			GetLogger().Log("Worker %d reached dynamic stop at %d", w.ID, current)
+			return
+		}
+
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			// Write to file
+			_, writeErr := dm.file.WriteAt(buf[:n], current)
+			if writeErr != nil {
+				dm.reportError(writeErr)
+				return
+			}
+
+			// Update progress
+			atomic.AddInt64(&w.Current, int64(n))
+		}
+
+		if readErr != nil {
+			if readErr == io.EOF {
+				w.Completed = true
+				return
+			}
+			dm.reportError(readErr)
+			return
+		}
 	}
 }
 
-// QueueSegment adds segment back to pending queue
-func (sm *SegmentManager) QueueSegment(seg *Segment) {
+func (dm *DownloadManager) reportError(err error) {
 	select {
-	case sm.pendingQueue <- seg:
+	case dm.errChan <- err:
 	default:
-		// Queue full, try in goroutine
-		go func() { sm.pendingQueue <- seg }()
 	}
-}
-
-// MarkCompleted marks a segment as completed
-func (sm *SegmentManager) MarkCompleted(seg *Segment) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	seg.Completed = true
-	sm.completedCount++
-}
-
-// AllCompleted checks if all segments are downloaded
-func (sm *SegmentManager) AllCompleted() bool {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	for _, seg := range sm.segments {
-		if !seg.Completed {
-			return false
-		}
-	}
-	return true
-}
-
-// GetSegmentCount returns the number of segments
-func (sm *SegmentManager) GetSegmentCount() int {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	return len(sm.segments)
 }
 
 // AdaptiveDownloadHandler handles the adaptive_download tool call
@@ -293,15 +381,13 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 	startTime := time.Now()
 	result := AdaptiveDownloadResult{}
 
-	// Detect resource if size not provided or we need range support check
+	// Detect resource
 	detectResult := DetectResource(args.URL, args.Cookies, args.UserAgent)
 
-	// If explicit size provided, use it
 	fileSize := args.Size
 	if fileSize == 0 {
 		fileSize = detectResult.Size
 	} else if detectResult.Size > 0 && detectResult.Size != fileSize {
-		// Log mismatch but trust explicit size
 		GetLogger().Log("Size mismatch: provided=%d, detected=%d. Using provided size.", fileSize, detectResult.Size)
 	}
 
@@ -318,15 +404,7 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 		return result
 	}
 
-	// If no range support, do simple download
-	if !detectResult.AcceptRanges {
-		GetLogger().Log("No range support, using single download")
-		return singleDownload(ctx, args, fileSize, startTime)
-	}
-
-	GetLogger().LogDownloadStart(args.URL, fileSize, detectResult.AcceptRanges)
-
-	// Create destination directory
+	// Create output file
 	destDir := filepath.Dir(args.DestPath)
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		result.Status = "error"
@@ -335,7 +413,6 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 		return result
 	}
 
-	// Create and pre-allocate file
 	outFile, err := os.OpenFile(args.DestPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		result.Status = "error"
@@ -352,194 +429,15 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 		return result
 	}
 
-	// Initialize congestion controller and segment manager
-	cc := NewCongestionController(args.InitialCwnd, args.MaxCwnd)
-	sm := NewSegmentManager(fileSize)
+	GetLogger().LogDownloadStart(args.URL, fileSize, detectResult.AcceptRanges)
 
-	// Main download loop
-	var wg sync.WaitGroup
-	errChan := make(chan error, 1)
-	doneChan := make(chan struct{})
-
-	go func() {
-		for !sm.AllCompleted() {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			cwnd := cc.GetCwnd()
-
-			// Launch cwnd number of concurrent downloads
-			for i := 0; i < cwnd; i++ {
-				seg, ok := sm.GetPendingSegment(100 * time.Millisecond)
-				if !ok {
-					break
-				}
-
-				wg.Add(1)
-				go func(segment *Segment) {
-					defer wg.Done()
-					segmentStart := time.Now()
-
-					// Force split segment until it's small enough for a "round"
-					// This ensures we get frequent feedback for congestion control
-					for segment.Size > MaxSegmentSize {
-						if newSeg := sm.SplitSegment(segment); newSeg != nil {
-							sm.QueueSegment(newSeg)
-						} else {
-							break
-						}
-					}
-
-					// Download this segment
-					data, err := downloadSegment(ctx, args.URL, segment.Start, segment.Start+segment.Size-1, args.Cookies, args.UserAgent)
-
-					if err != nil {
-						cc.OnFailure()
-						GetLogger().LogSegmentFailed(segment.Start, segment.Size, err)
-						// Re-queue segment for retry
-						sm.QueueSegment(segment)
-						select {
-						case errChan <- err:
-						default:
-						}
-					} else {
-						// Write directly to file at correct offset
-						_, writeErr := outFile.WriteAt(data, segment.Start)
-						if writeErr != nil {
-							cc.OnFailure()
-							GetLogger().Log("Failed to write segment at %d: %v", segment.Start, writeErr)
-							sm.QueueSegment(segment)
-							select {
-							case errChan <- writeErr:
-							default:
-							}
-						} else {
-							cc.OnSuccess()
-							GetLogger().LogSegmentComplete(segment.Start, segment.Size, time.Since(segmentStart))
-							sm.MarkCompleted(segment) // No data stored in segment anymore
-						}
-					}
-				}(seg)
-			}
-
-			// Wait for this round to complete
-			wg.Wait()
-
-			// Adjust congestion window based on results
-			cc.AdjustWindow()
-		}
-		close(doneChan)
-	}()
-
-	// Wait for completion or error
-	select {
-	case <-doneChan:
-		// Success
-	case <-ctx.Done():
-		result.Status = "error"
-		result.Error = "download cancelled"
-		result.TimeElapsed = time.Since(startTime).Seconds()
-		return result
+	// Single thread fallback
+	if !detectResult.AcceptRanges {
+		GetLogger().Log("No range support, using single download")
+		// Reuse manager but with maxCwnd=1
+		args.MaxCwnd = 1
 	}
 
-	result.Status = "success"
-	result.TimeElapsed = time.Since(startTime).Seconds()
-	result.BytesTotal = fileSize
-	result.SegmentCount = sm.GetSegmentCount()
-	result.FinalCwnd = cc.GetCwnd()
-
-	GetLogger().LogDownloadComplete(result.BytesTotal, time.Since(startTime), result.SegmentCount, result.FinalCwnd)
-
-	return result
-}
-
-func singleDownload(ctx context.Context, args AdaptiveDownloadArgs, fileSize int64, startTime time.Time) AdaptiveDownloadResult {
-	result := AdaptiveDownloadResult{}
-
-	data, err := downloadSegment(ctx, args.URL, 0, fileSize-1, args.Cookies, args.UserAgent)
-	if err != nil {
-		result.Status = "error"
-		result.Error = err.Error()
-		result.TimeElapsed = time.Since(startTime).Seconds()
-		return result
-	}
-
-	destDir := filepath.Dir(args.DestPath)
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		result.Status = "error"
-		result.Error = fmt.Sprintf("failed to create destination directory: %v", err)
-		result.TimeElapsed = time.Since(startTime).Seconds()
-		return result
-	}
-
-	if err := os.WriteFile(args.DestPath, data, 0644); err != nil {
-		result.Status = "error"
-		result.Error = fmt.Sprintf("failed to write file: %v", err)
-		result.TimeElapsed = time.Since(startTime).Seconds()
-		return result
-	}
-
-	result.Status = "success"
-	result.TimeElapsed = time.Since(startTime).Seconds()
-	result.BytesTotal = int64(len(data))
-	result.SegmentCount = 1
-	result.FinalCwnd = 1
-
-	return result
-}
-
-func downloadSegment(ctx context.Context, url string, start, end int64, cookies, userAgent string) ([]byte, error) {
-	client := &http.Client{
-		Timeout: 30 * time.Minute, // Increased timeout for large segments and slow connections
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	if cookies != "" {
-		req.Header.Set("Cookie", cookies)
-	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	} else {
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	return data, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+	dm := NewDownloadManager(ctx, args, fileSize, outFile)
+	return dm.Start()
 }
