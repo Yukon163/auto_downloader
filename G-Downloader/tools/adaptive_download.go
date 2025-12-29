@@ -15,6 +15,13 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
+const (
+	// MaxSegmentSize limits the size of a single download chunk.
+	// Smaller segments mean more frequent updates to cwnd and progress.
+	// 32MB at 10MB/s = ~3.2s per round
+	MaxSegmentSize = 32 * 1024 * 1024
+)
+
 /*
 TCP-like Congestion Control Download Algorithm
 
@@ -376,9 +383,14 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 					defer wg.Done()
 					segmentStart := time.Now()
 
-					// Try to split segment for more parallelism
-					if newSeg := sm.SplitSegment(segment); newSeg != nil {
-						sm.QueueSegment(newSeg)
+					// Force split segment until it's small enough for a "round"
+					// This ensures we get frequent feedback for congestion control
+					for segment.Size > MaxSegmentSize {
+						if newSeg := sm.SplitSegment(segment); newSeg != nil {
+							sm.QueueSegment(newSeg)
+						} else {
+							break
+						}
 					}
 
 					// Download this segment
