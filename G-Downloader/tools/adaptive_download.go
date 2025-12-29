@@ -46,6 +46,7 @@ type AdaptiveDownloadArgs struct {
 	UserAgent   string `json:"user_agent"`
 	InitialCwnd int    `json:"initial_cwnd"` // Optional: starting cwnd (default 1)
 	MaxCwnd     int    `json:"max_cwnd"`     // Optional: max concurrent connections (default 16)
+	Size        int64  `json:"size"`         // Optional: known file size (bypass HEAD detection)
 }
 
 // Segment represents a download segment (only start position needed)
@@ -301,17 +302,25 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 	startTime := time.Now()
 	result := AdaptiveDownloadResult{}
 
-	// Detect resource
+	// Detect resource if size not provided or we need range support check
 	detectResult := DetectResource(args.URL, args.Cookies, args.UserAgent)
-	if detectResult.Error != "" {
-		result.Status = "error"
-		result.Error = detectResult.Error
-		result.TimeElapsed = time.Since(startTime).Seconds()
-		return result
+
+	// If explicit size provided, use it
+	fileSize := args.Size
+	if fileSize == 0 {
+		fileSize = detectResult.Size
+	} else if detectResult.Size > 0 && detectResult.Size != fileSize {
+		// Log mismatch but trust explicit size
+		GetLogger().Log("Size mismatch: provided=%d, detected=%d. Using provided size.", fileSize, detectResult.Size)
 	}
 
-	fileSize := detectResult.Size
 	if fileSize == 0 {
+		if detectResult.Error != "" {
+			result.Status = "error"
+			result.Error = detectResult.Error
+			result.TimeElapsed = time.Since(startTime).Seconds()
+			return result
+		}
 		result.Status = "error"
 		result.Error = "could not determine file size"
 		result.TimeElapsed = time.Since(startTime).Seconds()

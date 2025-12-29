@@ -163,7 +163,8 @@ def adaptive_download(
     dest_path: str,
     cookies: str = "",
     user_agent: str = "",
-    max_cwnd: int = 16
+    max_cwnd: int = 16,
+    size: int = 0
 ) -> dict:
     """Call adaptive_download tool on the Go MCP server.
     Uses TCP-like congestion control with binary tree segmentation.
@@ -174,7 +175,8 @@ def adaptive_download(
         "initial_cwnd": 1,  # Start with slow start
         "max_cwnd": max_cwnd,
         "cookies": cookies,
-        "user_agent": user_agent
+        "user_agent": user_agent,
+        "size": size
     })
 
 
@@ -240,20 +242,32 @@ def handle_download_request(message: dict) -> dict:
             }
         
         # Step 3: Use adaptive download with TCP-like congestion control
-        dest_path = str(DOWNLOAD_DIR / filename)
+        # Determine destination path
+        # If filename contains a path (separator), try to respect it
+        if os.sep in filename or '/' in filename:
+            potential_path = Path(filename)
+            if potential_path.is_absolute():
+                dest_path = str(potential_path)
+            else:
+                dest_path = str(DOWNLOAD_DIR / filename)
+        else:
+            dest_path = str(DOWNLOAD_DIR / filename)
         
-        # Ensure unique filename
-        counter = 1
-        base_dest = dest_path
-        while os.path.exists(dest_path):
-            name, ext = os.path.splitext(base_dest)
-            dest_path = f"{name} ({counter}){ext}"
-            counter += 1
+        # Ensure unique filename if checking strictly in DOWNLOAD_DIR,
+        # but if user gave a specific path, we might just overwrite or use it?
+        # Let's stick to unique logic if it conflicts
+        if os.path.exists(dest_path):
+             counter = 1
+             base_dest = dest_path
+             while os.path.exists(dest_path):
+                name, ext = os.path.splitext(base_dest)
+                dest_path = f"{name} ({counter}){ext}"
+                counter += 1
         
         log(f"Starting adaptive download: {url} -> {dest_path}")
         
         download_result = adaptive_download(
-            client, url, dest_path, cookies, user_agent, MAX_CWND
+            client, url, dest_path, cookies, user_agent, MAX_CWND, size=file_size
         )
         
         if download_result.get("status") == "success":
