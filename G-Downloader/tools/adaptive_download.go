@@ -54,7 +54,6 @@ type Segment struct {
 	Start     int64
 	Size      int64 // Current segment size
 	Completed bool
-	Data      []byte
 }
 
 // CongestionController manages TCP-like congestion control
@@ -224,12 +223,11 @@ func (sm *SegmentManager) QueueSegment(seg *Segment) {
 }
 
 // MarkCompleted marks a segment as completed
-func (sm *SegmentManager) MarkCompleted(seg *Segment, data []byte) {
+func (sm *SegmentManager) MarkCompleted(seg *Segment) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	seg.Completed = true
-	seg.Data = data
 	sm.completedCount++
 }
 
@@ -244,20 +242,6 @@ func (sm *SegmentManager) AllCompleted() bool {
 		}
 	}
 	return true
-}
-
-// GetOrderedData returns all data in order
-func (sm *SegmentManager) GetOrderedData() []byte {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	result := make([]byte, 0, sm.fileSize)
-	for _, seg := range sm.segments {
-		if seg.Data != nil {
-			result = append(result, seg.Data...)
-		}
-	}
-	return result
 }
 
 // GetSegmentCount returns the number of segments
@@ -344,6 +328,23 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 		return result
 	}
 
+	// Create and pre-allocate file
+	outFile, err := os.OpenFile(args.DestPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		result.Status = "error"
+		result.Error = fmt.Sprintf("failed to create output file: %v", err)
+		result.TimeElapsed = time.Since(startTime).Seconds()
+		return result
+	}
+	defer outFile.Close()
+
+	if err := outFile.Truncate(fileSize); err != nil {
+		result.Status = "error"
+		result.Error = fmt.Sprintf("failed to allocate file space: %v", err)
+		result.TimeElapsed = time.Since(startTime).Seconds()
+		return result
+	}
+
 	// Initialize congestion controller and segment manager
 	cc := NewCongestionController(args.InitialCwnd, args.MaxCwnd)
 	sm := NewSegmentManager(fileSize)
@@ -393,9 +394,21 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 						default:
 						}
 					} else {
-						cc.OnSuccess()
-						GetLogger().LogSegmentComplete(segment.Start, segment.Size, time.Since(segmentStart))
-						sm.MarkCompleted(segment, data)
+						// Write directly to file at correct offset
+						_, writeErr := outFile.WriteAt(data, segment.Start)
+						if writeErr != nil {
+							cc.OnFailure()
+							GetLogger().Log("Failed to write segment at %d: %v", segment.Start, writeErr)
+							sm.QueueSegment(segment)
+							select {
+							case errChan <- writeErr:
+							default:
+							}
+						} else {
+							cc.OnSuccess()
+							GetLogger().LogSegmentComplete(segment.Start, segment.Size, time.Since(segmentStart))
+							sm.MarkCompleted(segment) // No data stored in segment anymore
+						}
 					}
 				}(seg)
 			}
@@ -420,28 +433,9 @@ func adaptiveDownload(ctx context.Context, args AdaptiveDownloadArgs) AdaptiveDo
 		return result
 	}
 
-	// Write all data to file
-	outFile, err := os.Create(args.DestPath)
-	if err != nil {
-		result.Status = "error"
-		result.Error = fmt.Sprintf("failed to create output file: %v", err)
-		result.TimeElapsed = time.Since(startTime).Seconds()
-		return result
-	}
-	defer outFile.Close()
-
-	data := sm.GetOrderedData()
-	n, err := outFile.Write(data)
-	if err != nil {
-		result.Status = "error"
-		result.Error = fmt.Sprintf("failed to write to file: %v", err)
-		result.TimeElapsed = time.Since(startTime).Seconds()
-		return result
-	}
-
 	result.Status = "success"
 	result.TimeElapsed = time.Since(startTime).Seconds()
-	result.BytesTotal = int64(n)
+	result.BytesTotal = fileSize
 	result.SegmentCount = sm.GetSegmentCount()
 	result.FinalCwnd = cc.GetCwnd()
 
@@ -487,7 +481,7 @@ func singleDownload(ctx context.Context, args AdaptiveDownloadArgs, fileSize int
 
 func downloadSegment(ctx context.Context, url string, start, end int64, cookies, userAgent string) ([]byte, error) {
 	client := &http.Client{
-		Timeout: 2 * time.Minute, // Shorter timeout for adaptive retry
+		Timeout: 30 * time.Minute, // Increased timeout for large segments and slow connections
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
